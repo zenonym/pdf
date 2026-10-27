@@ -150,21 +150,79 @@ function sizeForPoints(points) {
   return { width: Math.max(2, Math.round(width * scale)), height: Math.max(2, Math.round(height * scale)) };
 }
 
-function perspectiveWarp(sourceCanvas, points) {
-  const cv = state.cv;
+function solveLinearSystem(matrix, values) {
+  const rows = matrix.map((row, index) => [...row, values[index]]);
+  const size = values.length;
+  for (let column = 0; column < size; column += 1) {
+    let pivot = column;
+    for (let row = column + 1; row < size; row += 1) if (Math.abs(rows[row][column]) > Math.abs(rows[pivot][column])) pivot = row;
+    if (Math.abs(rows[pivot][column]) < 1e-10) throw new Error('Move the corners so they do not cross.');
+    [rows[column], rows[pivot]] = [rows[pivot], rows[column]];
+    const divisor = rows[column][column];
+    for (let cell = column; cell <= size; cell += 1) rows[column][cell] /= divisor;
+    for (let row = 0; row < size; row += 1) {
+      if (row === column) continue;
+      const factor = rows[row][column];
+      for (let cell = column; cell <= size; cell += 1) rows[row][cell] -= factor * rows[column][cell];
+    }
+  }
+  return rows.map((row) => row[size]);
+}
+
+function perspectiveWarp(sourceCanvas, points, outputCanvas = null) {
   const { width, height } = sizeForPoints(points);
-  const src = cv.imread(sourceCanvas);
-  const dst = new cv.Mat();
-  const from = cv.matFromArray(4, 1, cv.CV_32FC2, points.flatMap(({ x, y }) => [x, y]));
-  const to = cv.matFromArray(4, 1, cv.CV_32FC2, [0, 0, width - 1, 0, width - 1, height - 1, 0, height - 1]);
-  const matrix = cv.getPerspectiveTransform(from, to);
-  try {
-    cv.warpPerspective(src, dst, matrix, new cv.Size(width, height), cv.INTER_CUBIC, cv.BORDER_REPLICATE);
-    const result = document.createElement('canvas');
-    result.width = width; result.height = height;
-    cv.imshow(result, dst);
-    return result;
-  } finally { src.delete(); dst.delete(); from.delete(); to.delete(); matrix.delete(); }
+  const sourceCorners = points.map(({ x, y }) => ({ x: x / sourceCanvas.width, y: y / sourceCanvas.height }));
+  const destinationCorners = [{ x: 0, y: 0 }, { x: 1, y: 0 }, { x: 1, y: 1 }, { x: 0, y: 1 }];
+  const matrix = [], values = [];
+  destinationCorners.forEach(({ x, y }, index) => {
+    const { x: u, y: v } = sourceCorners[index];
+    matrix.push([x, y, 1, 0, 0, 0, -x * u, -y * u]); values.push(u);
+    matrix.push([0, 0, 0, x, y, 1, -x * v, -y * v]); values.push(v);
+  });
+  const h = solveLinearSystem(matrix, values);
+  const result = outputCanvas || document.createElement('canvas');
+  result.width = width; result.height = height;
+  const gl = result.getContext('webgl', { alpha: false, antialias: false, preserveDrawingBuffer: true });
+  if (!gl) throw new Error('Perspective correction is unavailable in this browser. Try a recent browser with WebGL enabled.');
+  let resources = result.__folioWarpResources;
+  if (!resources) {
+    const compile = (kind, source) => {
+      const shader = gl.createShader(kind);
+      gl.shaderSource(shader, source); gl.compileShader(shader);
+      if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) { const message = gl.getShaderInfoLog(shader); gl.deleteShader(shader); throw new Error(message || 'Could not prepare the crop preview.'); }
+      return shader;
+    };
+    const vertex = compile(gl.VERTEX_SHADER, 'attribute vec2 a_position; varying vec2 v_dest; void main(){ gl_Position=vec4(a_position,0.0,1.0); v_dest=vec2((a_position.x+1.0)*0.5,(1.0-a_position.y)*0.5); }');
+    const fragment = compile(gl.FRAGMENT_SHADER, 'precision highp float; varying vec2 v_dest; uniform sampler2D u_image; uniform vec3 u_h0; uniform vec3 u_h1; uniform vec3 u_h2; void main(){ vec3 p=vec3(v_dest,1.0); vec3 q=vec3(dot(u_h0,p),dot(u_h1,p),dot(u_h2,p)); gl_FragColor=texture2D(u_image,vec2(q.x/q.z,1.0-q.y/q.z)); }');
+    const program = gl.createProgram();
+    gl.attachShader(program, vertex); gl.attachShader(program, fragment); gl.linkProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(program) || 'Could not prepare the crop preview.');
+    resources = { program, buffer: gl.createBuffer(), texture: gl.createTexture(), source: null,
+      position: gl.getAttribLocation(program, 'a_position'),
+      image: gl.getUniformLocation(program, 'u_image'),
+      h0: gl.getUniformLocation(program, 'u_h0'), h1: gl.getUniformLocation(program, 'u_h1'), h2: gl.getUniformLocation(program, 'u_h2') };
+    gl.bindBuffer(gl.ARRAY_BUFFER, resources.buffer);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+    gl.bindTexture(gl.TEXTURE_2D, resources.texture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    result.__folioWarpResources = resources;
+  }
+  gl.useProgram(resources.program);
+  gl.bindBuffer(gl.ARRAY_BUFFER, resources.buffer);
+  gl.enableVertexAttribArray(resources.position); gl.vertexAttribPointer(resources.position, 2, gl.FLOAT, false, 0, 0);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, resources.texture);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true); gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+  if (resources.source !== sourceCanvas) {
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, sourceCanvas);
+    resources.source = sourceCanvas;
+  }
+  gl.uniform1i(resources.image, 0);
+  gl.uniform3f(resources.h0, h[0], h[1], h[2]);
+  gl.uniform3f(resources.h1, h[3], h[4], h[5]);
+  gl.uniform3f(resources.h2, h[6], h[7], 1);
+  gl.viewport(0, 0, width, height); gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  return result;
 }
 
 function makeFilteredCanvas(source, filter) {
@@ -227,7 +285,7 @@ function schedulePreview(page) {
   clearTimeout(state.previewTimer);
   state.previewTimer = setTimeout(() => {
     try {
-      page.correctedCanvas = perspectiveWarp(page.sourceCanvas, page.points);
+      page.correctedCanvas = perspectiveWarp(page.sourceCanvas, page.points, page.correctedCanvas);
       drawResultPreview(page);
       setStatus(page.autoDetected ? 'Page edges found — adjust if needed' : 'Edges set manually — drag to refine', page.autoDetected ? 'good' : 'manual');
       renderPageList();
@@ -247,24 +305,18 @@ function drawResultPreview(page) {
 }
 
 async function processPage(page) {
-  els.imageLoader.classList.add('visible');
-  setStatus('Finding the page edges…');
+  page.points = fullImageCorners(page.sourceCanvas);
+  page.autoDetected = false;
   try {
-    page.points = await findPageCorners(page.sourceCanvas);
-    page.autoDetected = true;
-    page.correctedCanvas = perspectiveWarp(page.sourceCanvas, page.points);
-    setStatus('Page edges found — adjust if needed');
+    page.correctedCanvas = perspectiveWarp(page.sourceCanvas, page.points, page.correctedCanvas);
+    setStatus('Adjust the corners now, or find edges automatically');
   } catch (error) {
-    page.points = fullImageCorners(page.sourceCanvas);
-    page.autoDetected = false;
-    try { page.correctedCanvas = perspectiveWarp(page.sourceCanvas, page.points); } catch { page.correctedCanvas = page.sourceCanvas; }
-    setStatus('Page outline not found — drag corners to fit', 'manual');
-    if (!state.cv) showToast(error.message);
-  } finally {
-    els.imageLoader.classList.remove('visible');
-    if (selectedPage()?.id === page.id) renderCurrentPage();
-    renderPageList();
+    page.correctedCanvas = page.sourceCanvas;
+    setStatus('Adjust the corners or try another browser', 'manual');
+    showToast(error.message);
   }
+  if (selectedPage()?.id === page.id) renderCurrentPage();
+  renderPageList();
 }
 
 async function addFiles(fileList) {
@@ -381,7 +433,7 @@ async function redoDetection() {
     page.points = await findPageCorners(page.sourceCanvas); page.autoDetected = true;
     page.correctedCanvas = perspectiveWarp(page.sourceCanvas, page.points);
     setStatus('Page edges found — adjust if needed'); renderCurrentPage(); renderPageList();
-  } catch (error) { page.autoDetected = false; setStatus('Page outline not found — drag corners to fit', 'manual'); showToast('Couldn’t find a new outline. Try adjusting the corners by hand.'); }
+  } catch (error) { page.autoDetected = false; setStatus('Page outline not found — drag corners to fit', 'manual'); showToast(error.message.includes('page finder') || error.message.includes('page outline') ? error.message : 'Couldn’t find a new outline. Try adjusting the corners by hand.'); }
   finally { els.imageLoader.classList.remove('visible'); }
 }
 
